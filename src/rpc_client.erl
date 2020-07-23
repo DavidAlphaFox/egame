@@ -11,15 +11,18 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/0]).
+-export([start_link/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3, format_status/2]).
+-export([call/3]).
 
 -define(SERVER, ?MODULE).
 
--record(state, {socket}).
+-record(state, {socket,
+                buffer,
+                caller}).
 
 %%%===================================================================
 %%% API
@@ -30,17 +33,18 @@
 %% Starts the server
 %% @end
 %%--------------------------------------------------------------------
--spec start_link() -> {ok, Pid :: pid()} |
+-spec start_link(integer()) -> {ok, Pid :: pid()} |
         {error, Error :: {already_started, pid()}} |
         {error, Error :: term()} |
         ignore.
-start_link() ->
-  gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+start_link(Port) ->
+  gen_server:start_link({local, ?SERVER}, ?MODULE, [Port], []).
 
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
-
+call(Module,Function,Params)->
+  gen_server:call(?SERVER,{Module,Function,Params}).
 %%--------------------------------------------------------------------
 %% @private
 %% @doc
@@ -52,11 +56,11 @@ start_link() ->
         {ok, State :: term(), hibernate} |
         {stop, Reason :: term()} |
         ignore.
-init([]) ->
-  {ok, Sock} = gen_tcp:connect({127,0,0,1}, 3389,
+init([Port]) ->
+  {ok, Sock} = gen_tcp:connect({127,0,0,1}, Port,
                                [binary, {packet, 0}]),
-  inet:setopts(Sock, {ative,once}),
-  {ok, #state{socket = Sock}}.
+  inet:setopts(Sock, [{ative,once}]),
+  {ok, #state{socket = Sock,buffer = rpc_protocol:new()}}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -73,9 +77,11 @@ init([]) ->
         {noreply, NewState :: term(), hibernate} |
         {stop, Reason :: term(), Reply :: term(), NewState :: term()} |
         {stop, Reason :: term(), NewState :: term()}.
-handle_call(_Request, _From, State) ->
-  Reply = ok,
-  {reply, Reply, State}.
+handle_call({Module,Function,Params}, From,
+            #state{socket = Socket } = State) ->
+  Frame = rpc_protocol:encode(Module, Function, Params),
+  ok = gen_tcp:send(Socket, Frame),
+  {noreply,State#state{caller = From}}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -102,10 +108,15 @@ handle_cast(_Request, State) ->
         {noreply, NewState :: term(), Timeout :: timeout()} |
         {noreply, NewState :: term(), hibernate} |
         {stop, Reason :: normal | term(), NewState :: term()}.
-handle_info({tcp, Socket, _Data},#state{socket = Socket} = State)->
+handle_info({tcp, Socket, Data},#state{socket = Socket} = State)->
+  State0 = handle_data(Data,State),
+  inet:setopts(Socket, [{active,once}]),
+  {noreply,State0};
+handle_info({tcp_closed,Socket},#state{socket = Socket} = State)->
+  {stop,normal,State#state{socket = undefined}};
+handle_info({tcp_error, Socket, Reason},#state{socket = Socket} = State ) ->
+  {stop,Reason,State#state{socket = undefiend}};
 
-  inet:setopts(Socket, {active,onece}),
-  {noreply,State};
 handle_info(_Info, State) ->
   {noreply, State}.
 
@@ -120,7 +131,9 @@ handle_info(_Info, State) ->
 %%--------------------------------------------------------------------
 -spec terminate(Reason :: normal | shutdown | {shutdown, term()} | term(),
                 State :: term()) -> any().
-terminate(_Reason, _State) ->
+terminate(_Reason,#state{socket = undefined}) -> ok;
+terminate(_Reason,#state{socket = Socket}) ->
+  catch gen_tcp:close(Socket),
   ok.
 
 %%--------------------------------------------------------------------
@@ -152,3 +165,11 @@ format_status(_Opt, Status) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+handle_data(Data,#state{buffer = Buffer,caller = Caller} = State)->
+  {Reps,Buffer0} = rpc_protocol:decode(Data,Buffer),
+  case Reps of
+    [Rep] ->
+      gen_server:reply(Caller, Rep),
+      State#state{buffer = Buffer0,caller = undefined};
+    [] -> State#state{buffer = Buffer0}
+end.
