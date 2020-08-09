@@ -190,7 +190,7 @@ handle_error(State, Function, Error, Seqid) ->
     error_logger:error_msg("~p had an error: ~p~n", [Function, Error]),
 
     Message =
-        case application:get_env(thrift, exceptions_include_traces) of
+    case application:get_env(thrift, exceptions_include_traces) of
             {ok, true} ->
                 lists:flatten(io_lib:format("An error occurred: ~p~n",
                                             [Error]));
